@@ -1,4 +1,5 @@
-package main
+// Package web serves the UI: the Next.js export of web/, embedded, under /ui/, and /ui/config.json.
+package web
 
 import (
 	"crypto/sha256"
@@ -12,7 +13,7 @@ import (
 	"strings"
 )
 
-// The export (web/out) is copied into ui/ before the binary is built (see ui/.gitignore and
+// The export (web/out) is copied into ui/ here before the binary is built (see ui/.gitignore and
 // web/scripts/embed.mjs). A build without it serves no pages.
 //
 //go:embed all:ui
@@ -60,7 +61,8 @@ func pagePolicy(page []byte) string {
 // Handler serves the UI under /ui/, its /ui/config.json, /healthz, and a redirect from / to
 // /ui/. A page is served at its directory (/ui/tasks/ is tasks/index.html); anything that is not
 // a file of the export is the export's 404 page.
-func Handler(files fs.FS, cfg Config, helper *api) (http.Handler, error) {
+// routes, if not nil, adds more endpoints (the helper API) to the same mux.
+func Handler(files fs.FS, cfg Config, routes func(*http.ServeMux)) (http.Handler, error) {
 	policies := map[string]string{} // .html file -> its Content-Security-Policy
 	err := fs.WalkDir(files, ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(name, ".html") {
@@ -91,8 +93,8 @@ func Handler(files fs.FS, cfg Config, helper *api) (http.Handler, error) {
 	}
 
 	mux := http.NewServeMux()
-	if helper != nil {
-		helper.routes(mux)
+	if routes != nil {
+		routes(mux)
 	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {

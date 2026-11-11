@@ -1,8 +1,9 @@
-package main
+package helper
 
 import (
 	"context"
 	"errors"
+	"flag"
 	"log/slog"
 	"net/http"
 	"os"
@@ -80,7 +81,7 @@ func finish(ctx context.Context, k *kube, p *pulpClient, ref secretRef, log *slo
 
 // maintain runs after a rotation: pulp-nextui's robot roles exist as defined, and robots past their
 // expiry are disabled.
-func maintain(ctx context.Context, a *api, now time.Time) error {
+func maintain(ctx context.Context, a *API, now time.Time) error {
 	for _, t := range repositoryTypes {
 		if err := a.ensureRole(ctx, t.pushRole, t.pushPermissions); err != nil {
 			return err
@@ -104,4 +105,48 @@ func maintain(ctx context.Context, a *api, now time.Time) error {
 		a.log.Info("robot expired: disabled", "robot", u.Username, "expires", rb.Expires)
 	}
 	return nil
+}
+
+// Rotate is "pulp-nextui rotate prepare|finish ...": steps 1 and 3 of the credentials Job. It returns
+// the process exit code.
+func Rotate(log *slog.Logger, args []string) int {
+	if len(args) == 0 || (args[0] != "prepare" && args[0] != "finish") {
+		log.Error("usage: pulp-nextui rotate prepare|finish ...")
+		return 2
+	}
+	step := args[0]
+	fs := flag.NewFlagSet("rotate "+step, flag.ExitOnError)
+	pulpURL := fs.String("pulp", "", "Pulp's API inside the cluster, e.g. http://pulp-api-svc:24817 (finish)")
+	secret := fs.String("credentials-secret", "", "namespace/name of the helper's credentials Secret (required)")
+	out := fs.String("out", "", "directory to write username and the new password to, for the set-password step (prepare)")
+	fs.Parse(args[1:])
+	ref, err := parseSecretRef(*secret)
+	if err != nil || (step == "finish" && *pulpURL == "") || (step == "prepare" && *out == "") {
+		log.Error("rotate "+step+": missing flags", "err", err)
+		return 2
+	}
+	k, err := inCluster()
+	if err != nil {
+		log.Error("rotate", "err", err)
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if step == "prepare" {
+		if err := prepare(ctx, k, ref, *out, log); err != nil {
+			log.Error("rotate prepare", "err", err)
+			return 1
+		}
+		return 0
+	}
+	p := newPulpClient(*pulpURL, k, ref)
+	if err := finish(ctx, k, p, ref, log); err != nil {
+		log.Error("rotate finish", "err", err)
+		return 1
+	}
+	if err := maintain(ctx, &API{pulp: p, log: log}, time.Now()); err != nil {
+		log.Error("maintain", "err", err)
+		return 1
+	}
+	return 0
 }

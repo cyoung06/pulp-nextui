@@ -1,4 +1,4 @@
-package main
+package helper
 
 import (
 	"context"
@@ -257,12 +257,10 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(ks.Close)
 	k := &kube{base: ks.URL, token: "t", client: ks.Client()}
 	client := newPulpClient(ps.URL, k, secretRef{"pulp", "creds"})
-	a := &api{pulp: client, origin: "https://pulp.example.org", log: slog.New(slog.NewTextHandler(io.Discard, nil))}
-	h, err := Handler(UI(), Config{LoginURL: "/x"}, a)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &harness{fp, fk, h, client, k}
+	a := &API{pulp: client, origin: "https://pulp.example.org", log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	mux := http.NewServeMux()
+	a.Routes(mux)
+	return &harness{fp, fk, mux, client, k}
 }
 
 func (h *harness) call(t *testing.T, method, path, session string, body any, headers map[string]string) (int, map[string]any) {
@@ -407,7 +405,7 @@ func TestExpiredRobotsAreDisabled(t *testing.T) {
 	fresh.FirstName, fresh.LastName = repoA, tomorrow
 	forever := h.pulp.add("robot+team+forever", "x", false)
 	forever.FirstName = repoA
-	if err := maintain(context.Background(), &api{pulp: h.client, log: slog.New(slog.NewTextHandler(io.Discard, nil))}, time.Now()); err != nil {
+	if err := maintain(context.Background(), &API{pulp: h.client, log: slog.New(slog.NewTextHandler(io.Discard, nil))}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if old.IsActive || !fresh.IsActive || !forever.IsActive {

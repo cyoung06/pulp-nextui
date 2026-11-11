@@ -1,8 +1,7 @@
-// pulp-nextui serves a web UI for Pulp (https://pulpproject.org): the static export of web/,
-// embedded, under /ui/, plus /ui/config.json telling it where Pulp's API is and where to sign in.
-// It runs on the same origin as Pulp, behind the same gateway or proxy: the UI calls Pulp's API
-// with the browser's Pulp session, so this server has no API, holds no secrets and makes no
-// network calls.
+// pulp-nextui serves a web UI for Pulp (https://pulpproject.org) under /ui/, on Pulp's own origin:
+// the UI calls Pulp's API with the browser's Pulp session. With -pulp it also serves the helper API
+// (/ui/api/: CLI secrets, robot accounts); "pulp-nextui rotate ..." is the job that creates and
+// rotates the Pulp account the helper acts as.
 package main
 
 import (
@@ -15,6 +14,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/cyoung06/pulp-nextui/internal/helper"
+	"github.com/cyoung06/pulp-nextui/internal/web"
 )
 
 var version = "dev"
@@ -22,9 +24,9 @@ var version = "dev"
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if len(os.Args) > 1 && os.Args[1] == "rotate" {
-		os.Exit(runRotate(log, os.Args[2:]))
+		os.Exit(helper.Rotate(log, os.Args[2:]))
 	}
-	var cfg Config
+	var cfg web.Config
 	listen := flag.String("listen", ":8080", "listen address (plain HTTP; TLS terminates at the gateway)")
 	pulpURL := flag.String("pulp", "", "Pulp's API inside the cluster, e.g. http://pulp-api-svc:24817: turns on the helper API (/ui/api/: CLI secrets, robot accounts); empty: off")
 	secret := flag.String("credentials-secret", "", "namespace/name of the Secret with the Pulp admin account the helper acts as (username, password[, next])")
@@ -46,22 +48,16 @@ func main() {
 		log.Error("-login-url is required")
 		os.Exit(2)
 	}
-	var helper *api
+	var routes func(*http.ServeMux)
 	if *pulpURL != "" {
-		ref, err := parseSecretRef(*secret)
-		if err != nil {
-			log.Error("-credentials-secret", "err", err)
-			os.Exit(2)
-		}
-		k, err := inCluster()
+		h, err := helper.New(*pulpURL, *secret, *origin, log)
 		if err != nil {
 			log.Error("helper", "err", err)
 			os.Exit(1)
 		}
-		helper = &api{pulp: newPulpClient(*pulpURL, k, ref), origin: strings.TrimRight(*origin, "/"), log: log}
-		cfg.Helper = true
+		routes, cfg.Helper = h.Routes, true
 	}
-	h, err := Handler(UI(), cfg, helper)
+	h, err := web.Handler(web.UI(), cfg, routes)
 	if err != nil {
 		log.Error("ui", "err", err)
 		os.Exit(1)
@@ -75,47 +71,4 @@ func main() {
 		log.Error("serve", "err", err)
 		os.Exit(1)
 	}
-}
-
-// runRotate is "pulp-nextui rotate prepare|finish": steps 1 and 3 of the credentials Job (rotate.go).
-func runRotate(log *slog.Logger, args []string) int {
-	if len(args) == 0 || (args[0] != "prepare" && args[0] != "finish") {
-		log.Error("usage: pulp-nextui rotate prepare|finish ...")
-		return 2
-	}
-	step := args[0]
-	fs := flag.NewFlagSet("rotate "+step, flag.ExitOnError)
-	pulpURL := fs.String("pulp", "", "Pulp's API inside the cluster, e.g. http://pulp-api-svc:24817 (finish)")
-	secret := fs.String("credentials-secret", "", "namespace/name of the helper's credentials Secret (required)")
-	out := fs.String("out", "", "directory to write username and the new password to, for the set-password step (prepare)")
-	fs.Parse(args[1:])
-	ref, err := parseSecretRef(*secret)
-	if err != nil || (step == "finish" && *pulpURL == "") || (step == "prepare" && *out == "") {
-		log.Error("rotate "+step+": missing flags", "err", err)
-		return 2
-	}
-	k, err := inCluster()
-	if err != nil {
-		log.Error("rotate", "err", err)
-		return 1
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	if step == "prepare" {
-		if err := prepare(ctx, k, ref, *out, log); err != nil {
-			log.Error("rotate prepare", "err", err)
-			return 1
-		}
-		return 0
-	}
-	p := newPulpClient(*pulpURL, k, ref)
-	if err := finish(ctx, k, p, ref, log); err != nil {
-		log.Error("rotate finish", "err", err)
-		return 1
-	}
-	if err := maintain(ctx, &api{pulp: p, log: log}, time.Now()); err != nil {
-		log.Error("maintain", "err", err)
-		return 1
-	}
-	return 0
 }

@@ -2,5 +2,5 @@
 web/node_modules
 web/.next
 web/out
-ui/*
-!ui/.gitignore
+internal/web/ui/*
+!internal/web/ui/.gitignore

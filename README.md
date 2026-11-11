@@ -111,10 +111,15 @@ or by hand:
 
 ```sh
 cd web && npm ci && npm run typecheck && npm run lint && npm run embed && cd ..
-go test . && go build .
+go test ./internal/... && go build ./cmd/pulp-nextui
 ```
 
-`ui/` holds the embedded export and is not in Git (only its `.gitignore`).
+| | |
+| --- | --- |
+| `cmd/pulp-nextui` | the binary: flags, `rotate` |
+| `internal/web` | serves the UI; `internal/web/ui` holds the embedded export (not in Git, only its `.gitignore`) |
+| `internal/helper` | the helper API and the credentials job |
+| `web/` | the Next.js app |
 
 ### Developing
 

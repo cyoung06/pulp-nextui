@@ -1,4 +1,6 @@
-package main
+// Package helper is pulp-nextui's helper API (/ui/api/) and the job that creates and rotates the Pulp
+// account it acts as.
+package helper
 
 import (
 	"context"
@@ -29,7 +31,8 @@ import (
 // carry X-Requested-With: XMLHttpRequest, which a cross-origin page can't send without a CORS
 // preflight this server never answers, and a same-origin Origin when they have one.
 
-type api struct {
+// API is the helper: what Pulp lets only admins do, done for signed-in users within narrow rules.
+type API struct {
 	pulp   *pulpClient
 	origin string // the public origin, e.g. https://pulp.example.org; empty: Origin isn't checked
 	log    *slog.Logger
@@ -84,7 +87,22 @@ func refuse(status int, format string, args ...any) error {
 	return &httpError{status, fmt.Sprintf(format, args...)}
 }
 
-func (a *api) routes(mux *http.ServeMux) {
+// New is the helper for Pulp's API at pulpURL (inside the cluster), acting as the account in the
+// Secret "namespace/name"; requests whose Origin isn't origin are refused.
+func New(pulpURL, secret, origin string, log *slog.Logger) (*API, error) {
+	ref, err := parseSecretRef(secret)
+	if err != nil {
+		return nil, err
+	}
+	k, err := inCluster()
+	if err != nil {
+		return nil, err
+	}
+	return &API{pulp: newPulpClient(pulpURL, k, ref), origin: strings.TrimRight(origin, "/"), log: log}, nil
+}
+
+// Routes adds the helper's endpoints to mux.
+func (a *API) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /ui/api/cli-secret", a.handle(a.cliSecret))
 	mux.HandleFunc("GET /ui/api/robots", a.handle(a.listRobots))
 	mux.HandleFunc("POST /ui/api/robots", a.handle(a.createRobot))
@@ -93,7 +111,7 @@ func (a *api) routes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /ui/api/robots/{id}", a.handle(a.deleteRobot))
 }
 
-func (a *api) handle(h func(*http.Request) (any, error)) http.HandlerFunc {
+func (a *API) handle(h func(*http.Request) (any, error)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", "application/json")
@@ -120,7 +138,7 @@ func (a *api) handle(h func(*http.Request) (any, error)) http.HandlerFunc {
 	}
 }
 
-func (a *api) guard(r *http.Request, h func(*http.Request) (any, error)) (any, error) {
+func (a *API) guard(r *http.Request, h func(*http.Request) (any, error)) (any, error) {
 	if r.Header.Get("X-Requested-With") != "XMLHttpRequest" {
 		return nil, refuse(http.StatusForbidden, "Missing X-Requested-With.")
 	}
@@ -139,7 +157,7 @@ type login struct {
 }
 
 // caller is who Pulp says the browser is.
-func (a *api) caller(r *http.Request) (login, error) {
+func (a *API) caller(r *http.Request) (login, error) {
 	var me login
 	if err := a.pulp.asUser(r.Context(), r, http.MethodGet, "/pulp/api/v3/login/", &me); err != nil {
 		return login{}, err
@@ -154,7 +172,7 @@ func (a *api) caller(r *http.Request) (login, error) {
 // that needs exactly that as the caller: GET {href}list_roles/ (policy:
 // has_model_or_obj_perms:<app>.manage_roles_<model>). Pulp answers with all its rules: superusers,
 // model-level and group roles, object roles. (my_permissions lists only object roles.)
-func (a *api) canManageRoles(r *http.Request, href string) (bool, error) {
+func (a *API) canManageRoles(r *http.Request, href string) (bool, error) {
 	err := a.pulp.asUser(r.Context(), r, http.MethodGet, href+"list_roles/", nil)
 	if isStatus(err, http.StatusForbidden) || isStatus(err, http.StatusNotFound) {
 		return false, nil
@@ -163,7 +181,7 @@ func (a *api) canManageRoles(r *http.Request, href string) (bool, error) {
 }
 
 // requireManage refuses unless Pulp says the caller may manage roles on the repository.
-func (a *api) requireManage(r *http.Request, href string) (repositoryType, error) {
+func (a *API) requireManage(r *http.Request, href string) (repositoryType, error) {
 	t, ok := typeOf(href)
 	if !ok {
 		return t, refuse(http.StatusBadRequest, "Not a Python, npm or Maven repository: %q.", href)
@@ -178,7 +196,7 @@ func (a *api) requireManage(r *http.Request, href string) (repositoryType, error
 	return t, nil
 }
 
-func (a *api) cliSecret(r *http.Request) (any, error) {
+func (a *API) cliSecret(r *http.Request) (any, error) {
 	me, err := a.caller(r)
 	if err != nil {
 		return nil, err
@@ -209,7 +227,7 @@ func robotOf(u pulpUser) (robot, bool) {
 	return robot{u.ID, u.Username, name, u.FirstName, u.IsActive, u.LastName, u.DateJoined}, true
 }
 
-func (a *api) listRobots(r *http.Request) (any, error) {
+func (a *API) listRobots(r *http.Request) (any, error) {
 	if _, err := a.caller(r); err != nil {
 		return nil, err
 	}
@@ -253,7 +271,7 @@ func decodeBody(r *http.Request, out any) error {
 	return nil
 }
 
-func (a *api) createRobot(r *http.Request) (any, error) {
+func (a *API) createRobot(r *http.Request) (any, error) {
 	me, err := a.caller(r)
 	if err != nil {
 		return nil, err
@@ -339,7 +357,7 @@ func (a *api) createRobot(r *http.Request) (any, error) {
 
 // privateGuards are the RBAC content guards of the distributions serving a repository, after checking
 // the caller may manage roles on each.
-func (a *api) privateGuards(r *http.Request, href string) ([]string, error) {
+func (a *API) privateGuards(r *http.Request, href string) ([]string, error) {
 	m := repositoryHref.FindStringSubmatch(href)
 	distributions := map[string]string{"python/python": "python/pypi", "npm/npm": "npm/npm", "maven/maven": "maven/maven"}[m[1]]
 	dists, err := allPages[struct {
@@ -366,7 +384,7 @@ func (a *api) privateGuards(r *http.Request, href string) ([]string, error) {
 }
 
 // ensureRole creates or corrects one of pulp-nextui's own minimal roles. Idempotent.
-func (a *api) ensureRole(ctx context.Context, name string, permissions []string) error {
+func (a *API) ensureRole(ctx context.Context, name string, permissions []string) error {
 	roles, err := allPages[pulpRole](ctx, a.pulp, "/pulp/api/v3/roles/"+query(map[string]string{"name": name}))
 	if err != nil {
 		return err
@@ -386,7 +404,7 @@ func (a *api) ensureRole(ctx context.Context, name string, permissions []string)
 }
 
 // robotFor loads robot {id} and checks the caller may manage its repository.
-func (a *api) robotFor(r *http.Request) (pulpUser, robot, error) {
+func (a *API) robotFor(r *http.Request) (pulpUser, robot, error) {
 	if _, err := a.caller(r); err != nil {
 		return pulpUser{}, robot{}, err
 	}
@@ -411,7 +429,7 @@ func (a *api) robotFor(r *http.Request) (pulpUser, robot, error) {
 	return u, rb, nil
 }
 
-func (a *api) robotSecret(r *http.Request) (any, error) {
+func (a *API) robotSecret(r *http.Request) (any, error) {
 	u, rb, err := a.robotFor(r)
 	if err != nil {
 		return nil, err
@@ -424,7 +442,7 @@ func (a *api) robotSecret(r *http.Request) (any, error) {
 	return map[string]any{"robot": rb, "secret": secret}, nil
 }
 
-func (a *api) changeRobot(r *http.Request) (any, error) {
+func (a *API) changeRobot(r *http.Request) (any, error) {
 	u, rb, err := a.robotFor(r)
 	if err != nil {
 		return nil, err
@@ -457,7 +475,7 @@ func (a *api) changeRobot(r *http.Request) (any, error) {
 	return rb, nil
 }
 
-func (a *api) deleteRobot(r *http.Request) (any, error) {
+func (a *API) deleteRobot(r *http.Request) (any, error) {
 	u, rb, err := a.robotFor(r)
 	if err != nil {
 		return nil, err
